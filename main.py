@@ -427,9 +427,15 @@ HTTP服务: {http_status}
         yield event.plain_result(menu_text.strip())
         
     @mp.command("搜索")
-    async def search_command(self, event: AstrMessageEvent, keyword: str):
+    async def search_command(self, event: AstrMessageEvent, *args):
         """搜索媒体内容"""
         userid = str(event.unified_msg_origin)
+        
+        # 将所有参数合并为一个关键词字符串
+        keyword = " ".join(args) if args else ""
+        if not keyword.strip():
+            yield event.plain_result("⚠️ 请输入搜索关键词")
+            return
         
         if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
@@ -1199,4 +1205,3 @@ class NotificationHandler(BaseHTTPRequestHandler):
                 self.logger.error(f"PUT read error: {e}", exc_info=True)
         self._process_and_queue(body=body)
         self._send_response()
-
