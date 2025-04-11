@@ -1,0 +1,57 @@
+{
+  "api_config": {
+    "description": "MP基础配置",
+    "type": "object",
+    "items": {
+      "username": {
+        "description": "MP用户名",
+        "type": "string",
+        "default": "",
+        "hint": "用于MP认证的用户名"
+      },
+      "password": {
+        "description": "MP密码",
+        "type": "string",
+        "default": "",
+        "hint": "用于MP认证的密码"
+      },
+      "base_url": {
+        "description": "MP基础地址",
+        "type": "string",
+        "default": "http://ip:30000",
+        "hint": "媒体服务器的基础URL地址，不要在末尾添加斜杠"
+      }
+    }
+  },
+  "display_config": {
+    "description": "媒体搜索设置",
+    "type": "object",
+    "items": {
+      "max_results": {
+        "description": "最大搜索结果数",
+        "type": "int",
+        "default": 5,
+        "hint": "搜索结果显示的最大条目数"
+      }
+    }
+  },
+  "notification_config": {
+    "description": "HTTP通知设置",
+    "type": "object",
+    "hint": "需要配合MP中的聚合消息通知使用，请选择非Get请求",
+    "items": {
+      "enabled": {
+        "description": "是否启用HTTP转发功能",
+        "type": "bool",
+        "default": false,
+        "hint": "打开将启用HTTP服务器和消息转发功能"
+      },
+      "listen_port": {
+        "description": "HTTP通知监听端口",
+        "type": "int",
+        "default": 28080,
+        "hint": "用于接收外部通知的HTTP服务器监听端口 (1024-65535)，请确保此端口未被占用。"
+      }
+    }
+  }
+}
