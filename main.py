@@ -22,10 +22,9 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp_ewedl", "EWEDL", "MP调用及消息转发", "1.3.7", "https://github.com/EWEDLCM/astrbot_plugin_mp")
+@register("astrbot_plugin_mp", "EWEDL", "MP调用及消息转发", "1.3.7", "https://github.com/EWEDLCM/astrbot_plugin_mp")
 class MediaSearchPlugin(Star):
-    """集成媒体搜索、订阅管理以及基于HTTP的分类消息通知功能。
-    支持持久化订阅和文件日志。"""
+    """支持媒体搜索、订阅管理以及基于HTTP的分类消息通知功能"""
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
@@ -81,9 +80,7 @@ class MediaSearchPlugin(Star):
         # 设置文件日志处理器
         log_handler = self._setup_reverse_log_handler(log_formatter)
         
-        # 如果文件日志设置失败，添加标准错误输出
         if not log_handler:
-            # 作为备用，添加标准错误输出
             console_handler = logging.StreamHandler(sys.stderr)
             console_handler.setFormatter(log_formatter)
             self.logger.addHandler(console_handler)
