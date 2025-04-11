@@ -42,23 +42,23 @@ class MediaSearchPlugin(Star):
         self.server_thread = None
         self.message_processor_task = None
         self.server_stop_event = threading.Event()
-        self.logger.info(f"Subscription persistence file path: {self.subscriptions_file}")
+        self.logger.info(f"订阅文件路径: {self.subscriptions_file}")
 
     def _init_paths(self):
         """初始化插件所需的路径配置"""
         try:
             self.plugin_dir = Path(__file__).resolve().parent
-            self.subscriptions_file = self.plugin_dir / "mp_notification_subscriptions.json"
+            self.subscriptions_file = self.plugin_dir / "mp_subs.json"
             self.log_file_path = self.plugin_dir / "http.log"
         except NameError:
             cwd = Path.cwd()
             self.plugin_dir = cwd
-            self.subscriptions_file = cwd / "mp_notification_subscriptions.json"
+            self.subscriptions_file = cwd / "mp_subs.json"
             self.log_file_path = cwd / "http.log"
         except Exception:
             # 如果上面方法都失败，使用固定相对路径
             self.plugin_dir = Path(".")
-            self.subscriptions_file = Path("./mp_notification_subscriptions.json")
+            self.subscriptions_file = Path("./mp_subs.json")
             self.log_file_path = Path("./http.log")
 
     def _init_logging(self):
