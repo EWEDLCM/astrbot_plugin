@@ -17,6 +17,8 @@ Content-Type:application/json
 ```
 感谢KoWming大佬提供思路！
 
+# 注意事项
+订阅功能当前仅支持默认设置的订阅操作，如需取消，请前往MP后台处理。
 # 支持
 
 [帮助文档](https://astrbot.app)
