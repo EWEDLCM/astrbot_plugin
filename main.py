@@ -22,7 +22,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp_ewedl", "EWEDL", "MP小工具-API调用及消息转发", "1.3.7", "https://github.com/EWEDLCM/astrbot_plugin_mp")
+@register("astrbot_plugin_mp_ewedl", "EWEDL", "MP小工具-API调用及消息转发", "2.1")
 class MediaSearchPlugin(Star):
     """包含媒体搜索、订阅管理以及基于HTTP的分类消息通知功能"""
     def __init__(self, context: Context, config: dict = None):
