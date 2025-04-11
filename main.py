@@ -387,7 +387,7 @@ class MediaSearchPlugin(Star):
 
     # --- 命令组和命令实现 ---
     @filter.command_group("MP")
-    def mp(self): 
+    def mp(self, event=None): 
         """MP命令组"""
         pass
         
