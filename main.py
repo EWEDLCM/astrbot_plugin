@@ -22,9 +22,10 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp_ewedl", "EWEDL", "MP小工具-API调用及消息转发", "2.1")
+@register("astrbot_plugin_mp_ewedl", "EWEDL", "MP调用及消息转发", "1.3.7")
 class MediaSearchPlugin(Star):
-    """包含媒体搜索、订阅管理以及基于HTTP的分类消息通知功能"""
+    """集成媒体搜索、订阅管理以及基于HTTP的分类消息通知功能。
+    支持持久化订阅和文件日志。"""
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
@@ -387,7 +388,7 @@ class MediaSearchPlugin(Star):
 
     # --- 命令组和命令实现 ---
     @filter.command_group("MP")
-    def mp(self, event=None): 
+    def mp(self): 
         """MP命令组"""
         pass
         
@@ -427,15 +428,9 @@ HTTP服务: {http_status}
         yield event.plain_result(menu_text.strip())
         
     @mp.command("搜索")
-    async def search_command(self, event: AstrMessageEvent, *args):
+    async def search_command(self, event: AstrMessageEvent, keyword: str):
         """搜索媒体内容"""
         userid = str(event.unified_msg_origin)
-        
-        # 将所有参数合并为一个关键词字符串
-        keyword = " ".join(args) if args else ""
-        if not keyword.strip():
-            yield event.plain_result("⚠️ 请输入搜索关键词")
-            return
         
         if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
@@ -1205,3 +1200,4 @@ class NotificationHandler(BaseHTTPRequestHandler):
                 self.logger.error(f"PUT read error: {e}", exc_info=True)
         self._process_and_queue(body=body)
         self._send_response()
+
