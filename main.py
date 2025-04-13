@@ -1,6 +1,6 @@
 import os
 import json
-import httpx
+import requests
 import asyncio
 import datetime
 from datetime import timedelta
@@ -22,9 +22,10 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp", "EWEDL", "MP调用及消息转发", "1.3.7", "https://github.com/EWEDLCM/astrbot_plugin_mp")
+@register("astrbot_plugin_mp", "EWEDL", "MP调用及消息转发", "1.3.7")
 class MediaSearchPlugin(Star):
-    """支持媒体搜索、订阅管理以及基于HTTP的分类消息通知功能"""
+    """集成媒体搜索、订阅管理以及基于HTTP的分类消息通知功能。
+    支持持久化订阅和文件日志。"""
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
@@ -41,23 +42,23 @@ class MediaSearchPlugin(Star):
         self.server_thread = None
         self.message_processor_task = None
         self.server_stop_event = threading.Event()
-        self.logger.info(f"订阅文件路径: {self.subscriptions_file}")
+        self.logger.info(f"Subscription persistence file path: {self.subscriptions_file}")
 
     def _init_paths(self):
         """初始化插件所需的路径配置"""
         try:
             self.plugin_dir = Path(__file__).resolve().parent
-            self.subscriptions_file = self.plugin_dir / "mp_subs.json"
+            self.subscriptions_file = self.plugin_dir / "mp_notification_subscriptions.json"
             self.log_file_path = self.plugin_dir / "http.log"
         except NameError:
             cwd = Path.cwd()
             self.plugin_dir = cwd
-            self.subscriptions_file = cwd / "mp_subs.json"
+            self.subscriptions_file = cwd / "mp_notification_subscriptions.json"
             self.log_file_path = cwd / "http.log"
         except Exception:
             # 如果上面方法都失败，使用固定相对路径
             self.plugin_dir = Path(".")
-            self.subscriptions_file = Path("./mp_subs.json")
+            self.subscriptions_file = Path("./mp_notification_subscriptions.json")
             self.log_file_path = Path("./http.log")
 
     def _init_logging(self):
@@ -80,7 +81,9 @@ class MediaSearchPlugin(Star):
         # 设置文件日志处理器
         log_handler = self._setup_reverse_log_handler(log_formatter)
         
+        # 如果文件日志设置失败，添加标准错误输出
         if not log_handler:
+            # 作为备用，添加标准错误输出
             console_handler = logging.StreamHandler(sys.stderr)
             console_handler.setFormatter(log_formatter)
             self.logger.addHandler(console_handler)
@@ -194,7 +197,7 @@ class MediaSearchPlugin(Star):
         if not self.base_url or not self.username or not self.password:
             self.logger.error("API配置不完整")
         else:
-            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            self.access_token = self.get_access_token(self.username, self.password, self.token_url)
             if not self.access_token:
                 self.logger.warning("初始令牌获取失败")
         
@@ -429,12 +432,12 @@ HTTP服务: {http_status}
         """搜索媒体内容"""
         userid = str(event.unified_msg_origin)
         
-        if not await self._ensure_token():
+        if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
             return
             
         self.token_refresh_count = 0
-        media_data = await self.search_media(self.access_token, keyword)
+        media_data = self.search_media(self.access_token, keyword)
         
         if media_data:
             cleaned_data = self.remove_empty_keys(media_data)
@@ -471,12 +474,12 @@ HTTP服务: {http_status}
         media_item = search_results[idx]
         media_title = media_item.get("title", "未知")
         
-        if not await self._ensure_token():
+        if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
             return
             
         transformed_data = self.transform_data(media_item)
-        response = await self.add_subscription(self.access_token, transformed_data)
+        response = self.add_subscription(self.access_token, transformed_data)
         
         if response and response.get("success") == True:
             yield event.plain_result(f"✅ `{media_title}` 订阅成功。")
@@ -487,12 +490,12 @@ HTTP服务: {http_status}
     @mp.command("查看订阅")
     async def view_subscriptions_command(self, event: AstrMessageEvent):
         """查看当前订阅"""
-        if not await self._ensure_token():
+        if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
             return
             
         self.token_refresh_count = 0
-        subscription_data = await self.get_subscription_data(self.access_token)
+        subscription_data = self.get_subscription_data(self.access_token)
         
         if subscription_data:
             yield event.plain_result(self.format_subscription_data(subscription_data))
@@ -502,12 +505,12 @@ HTTP服务: {http_status}
     @mp.command("搜索订阅")
     async def search_subscription_command(self, event: AstrMessageEvent, subscription_id: str = ""):
         """执行订阅搜索"""
-        if not await self._ensure_token():
+        if not self._ensure_token():
             yield event.plain_result("⚠️ Token获取失败。")
             return
             
         self.token_refresh_count = 0
-        search_result = await self.search_subscription(self.access_token, subscription_id.strip())
+        search_result = self.search_subscription(self.access_token, subscription_id.strip())
         
         if search_result:
             if search_result.get("success"):
@@ -679,15 +682,15 @@ HTTP服务: {http_status}
         # 关闭所有日志处理程序
         logging.shutdown()
 
-    async def _ensure_token(self) -> bool:
+    def _ensure_token(self) -> bool:
         """确保访问令牌有效，必要时获取新令牌"""
         if not self.access_token:
             self.logger.info("令牌缺失，获取新令牌")
-            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            self.access_token = self.get_access_token(self.username, self.password, self.token_url)
             return bool(self.access_token)
         return True
         
-    async def get_access_token(self, username, password, token_url):
+    def get_access_token(self, username, password, token_url):
         """获取API访问令牌"""
         if not token_url: 
             self.logger.error("令牌URL未配置")
@@ -698,20 +701,19 @@ HTTP服务: {http_status}
         
         try:
             self.logger.debug(f"请求令牌: {token_url}")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(token_url, data=data, headers=headers, timeout=10)
-                response.raise_for_status()
-                token_data = response.json()
-                token = token_data.get("access_token")
+            response = requests.post(token_url, data=data, headers=headers, timeout=10)
+            response.raise_for_status()
+            token_data = response.json()
+            token = token_data.get("access_token")
+            
+            if token: 
+                self.logger.info("令牌获取成功")
+                return token
+            else: 
+                self.logger.warning(f"响应中无令牌: {response.text}")
+                return None
                 
-                if token: 
-                    self.logger.info("令牌获取成功")
-                    return token
-                else: 
-                    self.logger.warning(f"响应中无令牌: {response.text}")
-                    return None
-                
-        except httpx.RequestError as e: 
+        except requests.exceptions.RequestException as e: 
             self.logger.error(f"令牌请求错误: {e}")
             return None
         except json.JSONDecodeError: 
@@ -721,7 +723,7 @@ HTTP服务: {http_status}
             self.logger.error(f"令牌获取未知错误: {e}", exc_info=True)
             return None
             
-    async def search_media(self, access_token, title):
+    def search_media(self, access_token, title):
         """搜索媒体内容"""
         if not self.base_url: 
             return None
@@ -732,31 +734,30 @@ HTTP服务: {http_status}
         
         try:
             self.logger.debug(f"搜索媒体: {search_url}")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(search_url, headers=headers, params=params, timeout=15)
-                
-                if response.status_code == 200: 
-                    self.logger.debug("搜索成功")
-                    return response.json()
-                elif response.status_code == 401 and self.token_refresh_count < 1:
-                    self.logger.warning("搜索需要更新令牌")
-                    self.token_refresh_count += 1
-                    if await self._ensure_token(): 
-                        return await self.search_media(self.access_token, title)
-                    else: 
-                        return None
+            response = requests.get(search_url, headers=headers, params=params, timeout=15)
+            
+            if response.status_code == 200: 
+                self.logger.debug("搜索成功")
+                return response.json()
+            elif response.status_code == 401 and self.token_refresh_count < 1:
+                self.logger.warning("搜索需要更新令牌")
+                self.token_refresh_count += 1
+                if self._ensure_token(): 
+                    return self.search_media(self.access_token, title)
                 else: 
-                    self.logger.error(f"搜索失败: {response.status_code} - {response.text}")
                     return None
+            else: 
+                self.logger.error(f"搜索失败: {response.status_code} - {response.text}")
+                return None
                 
-        except httpx.RequestError as e: 
+        except requests.exceptions.RequestException as e: 
             self.logger.error(f"搜索请求错误: {e}")
             return None
         except Exception as e: 
             self.logger.error(f"搜索未知错误: {e}", exc_info=True)
             return None
             
-    async def get_subscription_data(self, access_token):
+    def get_subscription_data(self, access_token):
         """获取订阅数据"""
         if not self.subscribe_url: 
             return None
@@ -765,24 +766,23 @@ HTTP服务: {http_status}
         
         try:
             self.logger.debug(f"获取订阅数据: {self.subscribe_url}")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(self.subscribe_url, headers=headers, timeout=15)
-                
-                if response.status_code == 200: 
-                    self.logger.debug("获取订阅成功")
-                    return response.json()
-                elif response.status_code == 401 and self.token_refresh_count < 1:
-                    self.logger.warning("获取订阅需要更新令牌")
-                    self.token_refresh_count += 1
-                    if await self._ensure_token(): 
-                        return await self.get_subscription_data(self.access_token)
-                    else: 
-                        return None
+            response = requests.get(self.subscribe_url, headers=headers, timeout=15)
+            
+            if response.status_code == 200: 
+                self.logger.debug("获取订阅成功")
+                return response.json()
+            elif response.status_code == 401 and self.token_refresh_count < 1:
+                self.logger.warning("获取订阅需要更新令牌")
+                self.token_refresh_count += 1
+                if self._ensure_token(): 
+                    return self.get_subscription_data(self.access_token)
                 else: 
-                    self.logger.error(f"获取订阅失败: {response.status_code} - {response.text}")
                     return None
+            else: 
+                self.logger.error(f"获取订阅失败: {response.status_code} - {response.text}")
+                return None
                 
-        except httpx.RequestError as e: 
+        except requests.exceptions.RequestException as e: 
             self.logger.error(f"获取订阅请求错误: {e}")
             return None
         except Exception as e: 
@@ -966,7 +966,7 @@ HTTP服务: {http_status}
         
         return tx
         
-    async def add_subscription(self, access_token, sub_data):
+    def add_subscription(self, access_token, sub_data):
         """添加订阅"""
         if not self.subscribe_url:
             return {"success": False, "msg": "订阅URL未配置"}
@@ -975,27 +975,26 @@ HTTP服务: {http_status}
         
         try:
             self.logger.debug(f"添加订阅请求: {self.subscribe_url}")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(self.subscribe_url, headers=headers, json=sub_data, timeout=20)
-                response.raise_for_status()
+            response = requests.post(self.subscribe_url, headers=headers, json=sub_data, timeout=20)
+            response.raise_for_status()
+            
+            try:
+                return response.json()
+            except json.JSONDecodeError:
+                self.logger.error(f"添加订阅响应JSON解析错误: {response.text}")
+                return {"success": False, "msg": "服务器响应格式错误"}
                 
-                try:
-                    return response.json()
-                except json.JSONDecodeError:
-                    self.logger.error(f"添加订阅响应JSON解析错误: {response.text}")
-                    return {"success": False, "msg": "服务器响应格式错误"}
-                
-        except httpx.HTTPStatusError as e:
+        except requests.exceptions.HTTPError as e:
             self.logger.error(f"添加订阅HTTP错误: {e.response.status_code} - {e.response.text}")
             return {"success": False, "msg": f"HTTP {e.response.status_code}"}
-        except httpx.RequestError as e:
+        except requests.exceptions.RequestException as e:
             self.logger.error(f"添加订阅请求错误: {e}")
             return {"success": False, "msg": "网络错误"}
         except Exception as e:
             self.logger.error(f"添加订阅未知错误: {e}", exc_info=True)
             return {"success": False, "msg": "内部错误"}
             
-    async def search_subscription(self, access_token, sub_id=""):
+    def search_subscription(self, access_token, sub_id=""):
         """搜索订阅"""
         if not self.base_url:
             return None
@@ -1005,26 +1004,25 @@ HTTP服务: {http_status}
         
         try:
             self.logger.debug(f"搜索订阅: {url}")
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, headers=headers, timeout=15)
-                
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 401 and self.token_refresh_count < 1:
-                    self.logger.warning("搜索订阅需要更新令牌")
-                    self.token_refresh_count += 1
-                    if await self._ensure_token():
-                        return await self.search_subscription(self.access_token, sub_id)
-                    else:
-                        return None
-                elif response.status_code == 404:
-                    self.logger.warning(f"搜索订阅404错误: ID '{sub_id}'")
-                    return {"success": False, "msg": f"ID {sub_id} 未找到"} if sub_id else {"success": True, "data": {"list": []}}
+            response = requests.get(url, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 401 and self.token_refresh_count < 1:
+                self.logger.warning("搜索订阅需要更新令牌")
+                self.token_refresh_count += 1
+                if self._ensure_token():
+                    return self.search_subscription(self.access_token, sub_id)
                 else:
-                    self.logger.error(f"搜索订阅失败: {response.status_code} - {response.text}")
                     return None
+            elif response.status_code == 404:
+                self.logger.warning(f"搜索订阅404错误: ID '{sub_id}'")
+                return {"success": False, "msg": f"ID {sub_id} 未找到"} if sub_id else {"success": True, "data": {"list": []}}
+            else:
+                self.logger.error(f"搜索订阅失败: {response.status_code} - {response.text}")
+                return None
                 
-        except httpx.RequestError as e:
+        except requests.exceptions.RequestException as e:
             self.logger.error(f"搜索订阅请求错误: {e}")
             return None
         except Exception as e:
