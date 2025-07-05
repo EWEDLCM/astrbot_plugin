@@ -58,9 +58,25 @@ class MediaSearchPlugin(Star):
             self.log_file_path = Path("./http.log")
 
     def _init_logging(self):
-        """初始化日志系统，使用框架logger，不再自定义文件日志"""
+        """初始化日志系统，使用框架logger，并额外写入详细日志文件"""
         self.logger = logger
         self.logger.info(f"详细日志系统初始化完成，保存在框架日志中")
+        # 额外写入详细日志文件
+        try:
+            import logging
+            detailed_log_path = self.data_dir / "detailed.log"
+            file_handler = logging.FileHandler(str(detailed_log_path), mode='a', encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('[%(asctime)s][%(levelname)s][%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+            file_handler.setFormatter(formatter)
+            # 为避免重复添加，先移除同类 handler
+            for h in list(self.logger.handlers):
+                if isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == str(detailed_log_path):
+                    self.logger.removeHandler(h)
+            self.logger.addHandler(file_handler)
+            self.logger.info("详细日志也写入: %s", str(detailed_log_path))
+        except Exception as e:
+            self.logger.warning(f"详细日志文件配置失败: {e}")
 
     def _check_and_clear_daily_log(self):
         """已弃用：每日清空日志逻辑，交由框架日志管理"""
@@ -468,8 +484,9 @@ HTTP服务: {http_status}
         media_title = media_item.get("title", "未知")
         source = media_item.get("source", "")
         tmdbid = media_item.get("tmdb_id")
-        # TMDB来源，需查季
-        if source == "themoviedb" and tmdbid:
+        media_type = media_item.get("type", "")
+        # 只有电视剧才查季
+        if source == "themoviedb" and tmdbid and media_type == "电视剧":
             if not self.access_token:
                 self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
                 if not self.access_token:
@@ -520,7 +537,7 @@ HTTP服务: {http_status}
             except Exception as e:
                 yield event.plain_result(f"⚠️ 查询季信息异常: {e}")
                 return
-        # 其他来源或无tmdbid，直接订阅
+        # 其他来源或无tmdbid或非电视剧，直接订阅
         if not self.access_token:
             self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
             if not self.access_token:
