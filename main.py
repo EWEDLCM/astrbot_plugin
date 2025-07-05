@@ -1,6 +1,6 @@
 import os
 import json
-import requests
+import aiohttp
 import asyncio
 import datetime
 from datetime import timedelta
@@ -22,7 +22,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp", "EWEDL", "MP调用及消息转发", "1.3.7")
+@register("astrbot_plugin_mp", "EWEDL", "MoviePilot小工具", "1.5.0")
 class MediaSearchPlugin(Star):
     """集成媒体搜索、订阅管理以及基于HTTP的分类消息通知功能。
     支持持久化订阅和文件日志。"""
@@ -42,107 +42,87 @@ class MediaSearchPlugin(Star):
         self.server_thread = None
         self.message_processor_task = None
         self.server_stop_event = threading.Event()
+        self.user_states = {}  # 多轮交互状态
+        self.pending_subscription = {}  # 记录待处理的多季订阅信息
         self.logger.info(f"Subscription persistence file path: {self.subscriptions_file}")
 
     def _init_paths(self):
         """初始化插件所需的路径配置"""
         try:
             self.plugin_dir = Path(__file__).resolve().parent
-            self.subscriptions_file = self.plugin_dir / "mp_notification_subscriptions.json"
+            self.subscriptions_file = self.plugin_dir / "mp_sub.json"
             self.log_file_path = self.plugin_dir / "http.log"
         except NameError:
             cwd = Path.cwd()
             self.plugin_dir = cwd
-            self.subscriptions_file = cwd / "mp_notification_subscriptions.json"
+            self.subscriptions_file = cwd / "mp_sub.json"
             self.log_file_path = cwd / "http.log"
         except Exception:
             # 如果上面方法都失败，使用固定相对路径
             self.plugin_dir = Path(".")
-            self.subscriptions_file = Path("./mp_notification_subscriptions.json")
+            self.subscriptions_file = Path("./mp_sub.json")
             self.log_file_path = Path("./http.log")
 
     def _init_logging(self):
-        """初始化日志系统"""
-        # 创建并配置日志记录器
+        """初始化日志系统，支持每日0点清空详细日志，并在插件启动时清空日志"""
         self.logger = logging.getLogger("MediaSearchPlugin")
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.DEBUG)  # 详细日志
         self.logger.propagate = False
-        
-        # 清理现有处理器
         for handler in self.logger.handlers[:]:
             self.logger.removeHandler(handler)
-        
-        # 设置基本格式
-        log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        
-        # 检查和清理旧日志
-        self._check_and_clear_weekly_logs()
-        
-        # 设置文件日志处理器
-        log_handler = self._setup_reverse_log_handler(log_formatter)
-        
-        # 如果文件日志设置失败，添加标准错误输出
-        if not log_handler:
-            # 作为备用，添加标准错误输出
+        log_formatter = logging.Formatter('[%(asctime)s][%(levelname)s][%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        # 日志文件名
+        self.detailed_log_file = self.plugin_dir / "detailed.log"
+        # 启动时清空日志
+        try:
+            self.detailed_log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.detailed_log_file, 'w', encoding='utf-8') as f:
+                f.write(f"--- 日志已于插件启动时({datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) 自动清空 ---\n")
+        except Exception as e:
+            print(f"[ERROR] 启动时清空日志失败: {e}", file=sys.stderr)
+        self._check_and_clear_daily_log()
+        try:
+            file_handler = logging.FileHandler(str(self.detailed_log_file), mode='a', encoding='utf-8')
+            file_handler.setFormatter(log_formatter)
+            file_handler.setLevel(logging.DEBUG)
+            self.logger.addHandler(file_handler)
+            self.logger.info("详细日志系统初始化完成，保存在: %s", self.detailed_log_file)
+        except Exception as e:
             console_handler = logging.StreamHandler(sys.stderr)
             console_handler.setFormatter(log_formatter)
             self.logger.addHandler(console_handler)
-            self.logger.warning("文件日志配置失败，使用控制台日志")
-    
-    def _check_and_clear_weekly_logs(self):
-        """检查并清理每周日志"""
-        if self.log_file_path and self.log_file_path.exists():
+            self.logger.warning("文件日志配置失败，使用控制台日志: %s", e)
+
+    def _check_and_clear_daily_log(self):
+        """每天0点后自动清空日志文件"""
+        if self.detailed_log_file.exists():
             try:
-                log_mod_time = self.log_file_path.stat().st_mtime
+                log_mod_time = self.detailed_log_file.stat().st_mtime
                 log_dt = datetime.datetime.fromtimestamp(log_mod_time)
-                log_year, log_week, _ = log_dt.isocalendar()
                 now = datetime.datetime.now()
-                current_year, current_week, _ = now.isocalendar()
-                
-                if current_year > log_year or (current_year == log_year and current_week > log_week):
-                    print(f"[INFO] Clearing previous week's log ({log_year}-W{log_week}): {self.log_file_path}", file=sys.stderr)
-                    with open(self.log_file_path, 'w', encoding='utf-8') as f:
-                        f.write(f"--- Log cleared on {now.strftime('%Y-%m-%d %H:%M:%S')} (Start of Week {current_week}) ---\n")
-                else:
-                    print(f"[INFO] Log file from current week ({log_year}-W{log_week}). Keeping logs.", file=sys.stderr)
+                if log_dt.date() != now.date():
+                    with open(self.detailed_log_file, 'w', encoding='utf-8') as f:
+                        f.write(f"--- 日志已于 {now.strftime('%Y-%m-%d %H:%M:%S')} 自动清空 ---\n")
+                    print(f"[INFO] 日志已于新的一天自动清空: {self.detailed_log_file}", file=sys.stderr)
             except Exception as e:
-                print(f"[ERROR] Log check/clear failed: {e}", file=sys.stderr)
-    
-    def _setup_reverse_log_handler(self, formatter):
-        """设置倒序日志处理器"""
-        if not self.log_file_path:
-            return None
-        
-        try:
-            # 确保日志目录存在
-            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # 如果文件不存在，先创建空文件
-            if not self.log_file_path.exists():
-                with open(self.log_file_path, 'w', encoding='utf-8') as f:
-                    f.write(f"--- 日志创建于 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            
-            # 创建倒序日志处理器
-            reverse_file_handler = ReverseOrderFileHandler(str(self.log_file_path), encoding='utf-8')
-            reverse_file_handler.setFormatter(formatter)
-            reverse_file_handler.setLevel(logging.INFO)
-            self.logger.addHandler(reverse_file_handler)
-            
-            # 添加一条日志确认消息
-            self.logger.info(f"日志系统初始化完成，使用倒序模式，保存在：{self.log_file_path}")
-            return reverse_file_handler
-        except Exception as e:
-            # 如果倒序处理器失败，尝试普通文件处理器
-            try:
-                standard_handler = logging.FileHandler(str(self.log_file_path), mode='a', encoding='utf-8')
-                standard_handler.setFormatter(formatter)
-                standard_handler.setLevel(logging.INFO)
-                self.logger.addHandler(standard_handler)
-                self.logger.info(f"使用标准日志处理器，文件：{self.log_file_path}")
-                return standard_handler
-            except Exception:
-                return None
-    
+                print(f"[ERROR] 日志每日清空失败: {e}", file=sys.stderr)
+
+    def _log_and_check_daily(self, level, msg, *args, **kwargs):
+        """写日志前自动检查是否需要清空"""
+        self._check_and_clear_daily_log()
+        if level == 'debug':
+            self.logger.debug(msg, *args, **kwargs)
+        elif level == 'info':
+            self.logger.info(msg, *args, **kwargs)
+        elif level == 'warning':
+            self.logger.warning(msg, *args, **kwargs)
+        elif level == 'error':
+            self.logger.error(msg, *args, **kwargs)
+        elif level == 'exception':
+            self.logger.exception(msg, *args, **kwargs)
+        else:
+            self.logger.info(msg, *args, **kwargs)
+
     def _load_api_config(self):
         """加载API配置"""
         api_config = self.config.get("api_config", {})
@@ -197,7 +177,7 @@ class MediaSearchPlugin(Star):
         if not self.base_url or not self.username or not self.password:
             self.logger.error("API配置不完整")
         else:
-            self.access_token = self.get_access_token(self.username, self.password, self.token_url)
+            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
             if not self.access_token:
                 self.logger.warning("初始令牌获取失败")
         
@@ -342,15 +322,20 @@ class MediaSearchPlugin(Star):
                         else:
                             title = raw_title
                             message = raw_message
+                    else:
+                        if raw_title is not None:
+                            title = raw_title
+                        if raw_message is not None:
+                            message = raw_message
                 except Exception as regex_err:
                     self.logger.error(f"正则解析错误: {regex_err}")
                 
-                # 组装最终消息
-                if title is not None and message is not None:
+                # 组装最终消息（优化：过滤None和'None'字符串）
+                if title is not None and message is not None and message not in [None, "None"]:
                     formatted_message = f"{title}\n{message}"
                 elif title is not None:
                     formatted_message = title
-                elif message is not None:
+                elif message is not None and message not in [None, "None"]:
                     formatted_message = message
                 else:
                     formatted_message = content_str
@@ -431,20 +416,18 @@ HTTP服务: {http_status}
     async def search_command(self, event: AstrMessageEvent, keyword: str):
         """搜索媒体内容"""
         userid = str(event.unified_msg_origin)
-        
-        if not self._ensure_token():
-            yield event.plain_result("⚠️ Token获取失败。")
-            return
-            
+        if not self.access_token:
+            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            if not self.access_token:
+                yield event.plain_result("⚠️ Token获取失败。")
+                return
         self.token_refresh_count = 0
-        media_data = self.search_media(self.access_token, keyword)
-        
+        media_data = await self.search_media(self.access_token, keyword)
         if media_data:
             cleaned_data = self.remove_empty_keys(media_data)
             if not cleaned_data:
                 yield event.plain_result("无匹配内容。")
                 return
-                
             self.user_search_results[userid] = cleaned_data
             result_text = self.format_search_results(cleaned_data) + "\n\n👉 可用 `MP 新增订阅 序号` 订阅"
             yield event.plain_result(result_text)
@@ -453,34 +436,84 @@ HTTP服务: {http_status}
         
     @mp.command("新增订阅")
     async def add_subscription_command(self, event: AstrMessageEvent, index: str):
-        """将搜索结果添加到订阅"""
+        """将搜索结果添加到订阅（支持TMDB多季选择）"""
         userid = str(event.unified_msg_origin)
-        
         if userid not in self.user_search_results or not self.user_search_results[userid]:
             yield event.plain_result("⚠️ 请先搜索。")
             return
-            
         try:
             idx = int(index) - 1
             search_results = self.user_search_results[userid]
-            
             if not (0 <= idx < len(search_results)):
                 yield event.plain_result(f"⚠️ 无效序号 {index} (范围 1-{len(search_results)})")
                 return
         except ValueError:
             yield event.plain_result(f"⚠️ 无效序号 {index} (请输入数字)。")
             return
-            
         media_item = search_results[idx]
         media_title = media_item.get("title", "未知")
-        
-        if not self._ensure_token():
-            yield event.plain_result("⚠️ Token获取失败。")
-            return
-            
+        source = media_item.get("source", "")
+        tmdbid = media_item.get("tmdb_id")
+        # TMDB来源，需查季
+        if source == "themoviedb" and tmdbid:
+            if not self.access_token:
+                self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+                if not self.access_token:
+                    yield event.plain_result("⚠️ Token获取失败。")
+                    return
+            # 查询季信息
+            tmdb_url = f"{self.base_url}/api/v1/tmdb/seasons/{tmdbid}"
+            try:
+                headers = {"accept": "application/json", "Authorization": f"Bearer {self.access_token}"}
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(tmdb_url, headers=headers) as resp:
+                        if resp.status == 200:
+                            seasons = await resp.json()
+                            if isinstance(seasons, list) and len(seasons) > 1:
+                                # 多季，提示用户选择
+                                season_list = []
+                                for i, s in enumerate(seasons, 1):
+                                    sn = s.get("season_number", "?")
+                                    name = s.get("name", "?")
+                                    season_list.append(f"{i}、第{sn}季 {name}")
+                                msg = "该剧集有多季，请回复所有或序号选择要订阅的季：\n" + "\n".join(season_list) + "\n（输入退出可取消）"
+                                self.user_states[userid] = "waiting_tmdb_season"
+                                self.pending_subscription[userid] = {
+                                    "media_item": media_item,
+                                    "seasons": seasons
+                                }
+                                yield event.plain_result(msg)
+                                return
+                            elif isinstance(seasons, list) and len(seasons) == 1:
+                                # 只有一季，直接订阅
+                                media_item = dict(media_item)
+                                media_item["season"] = seasons[0].get("season_number", 1)
+                                transformed_data = self.transform_data(media_item)
+                                response = await self.add_subscription(self.access_token, transformed_data)
+                                if response and response.get("success") == True:
+                                    yield event.plain_result(f"✅ `{media_title}` 订阅成功。")
+                                else:
+                                    error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                                    yield event.plain_result(f"⚠️ 订阅 `{media_title}` 失败: {error_msg}")
+                                return
+                            else:
+                                yield event.plain_result("⚠️ 未获取到季信息，无法订阅。")
+                                return
+                        else:
+                            yield event.plain_result(f"⚠️ 查询季信息失败: {resp.status}")
+                            return
+            except Exception as e:
+                yield event.plain_result(f"⚠️ 查询季信息异常: {e}")
+                return
+        # 其他来源或无tmdbid，直接订阅
+        if not self.access_token:
+            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            if not self.access_token:
+                yield event.plain_result("⚠️ Token获取失败。")
+                return
         transformed_data = self.transform_data(media_item)
-        response = self.add_subscription(self.access_token, transformed_data)
-        
+        response = await self.add_subscription(self.access_token, transformed_data)
         if response and response.get("success") == True:
             yield event.plain_result(f"✅ `{media_title}` 订阅成功。")
         else:
@@ -490,13 +523,13 @@ HTTP服务: {http_status}
     @mp.command("查看订阅")
     async def view_subscriptions_command(self, event: AstrMessageEvent):
         """查看当前订阅"""
-        if not self._ensure_token():
-            yield event.plain_result("⚠️ Token获取失败。")
-            return
-            
+        if not self.access_token:
+            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            if not self.access_token:
+                yield event.plain_result("⚠️ Token获取失败。")
+                return
         self.token_refresh_count = 0
-        subscription_data = self.get_subscription_data(self.access_token)
-        
+        subscription_data = await self.get_subscription_data(self.access_token)
         if subscription_data:
             yield event.plain_result(self.format_subscription_data(subscription_data))
         else:
@@ -505,13 +538,13 @@ HTTP服务: {http_status}
     @mp.command("搜索订阅")
     async def search_subscription_command(self, event: AstrMessageEvent, subscription_id: str = ""):
         """执行订阅搜索"""
-        if not self._ensure_token():
-            yield event.plain_result("⚠️ Token获取失败。")
-            return
-            
+        if not self.access_token:
+            self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+            if not self.access_token:
+                yield event.plain_result("⚠️ Token获取失败。")
+                return
         self.token_refresh_count = 0
-        search_result = self.search_subscription(self.access_token, subscription_id.strip())
-        
+        search_result = await self.search_subscription(self.access_token, subscription_id.strip())
         if search_result:
             if search_result.get("success"):
                 yield event.plain_result(f"✅ 执行订阅搜索{' (ID: ' + subscription_id + ')' if subscription_id else ''}。看后台任务。")
@@ -640,6 +673,83 @@ HTTP服务: {http_status}
         
         yield event.plain_result("\n".join(parts))
 
+    @filter.regex(r"^[\s\S]+")
+    async def handle_tmdb_season_input(self, event: AstrMessageEvent):
+        userid = str(getattr(event, "unified_msg_origin", None))
+        if userid not in self.user_states:
+            return
+        state = self.user_states[userid]
+        msg = event.message_str.strip()
+        if state == "waiting_tmdb_season":
+            if msg == "退出":
+                self.logger.info(f"[TMDB多季订阅] 用户{userid} 退出流程")
+                self.user_states.pop(userid, None)
+                self.pending_subscription.pop(userid, None)
+                yield event.plain_result("已退出多季订阅流程。")
+                return
+            if msg == "所有":
+                pending = self.pending_subscription.get(userid)
+                if not pending:
+                    self.user_states.pop(userid, None)
+                    yield event.plain_result("⚠️ 状态已失效，请重新发起订阅。")
+                    return
+                seasons = pending["seasons"]
+                media_item = dict(pending["media_item"])
+                results = []
+                for s in seasons:
+                    season_number = s.get("season_number", 1)
+                    media_item["season"] = season_number
+                    media_title = media_item.get("title", "未知")
+                    if not self.access_token:
+                        self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+                        if not self.access_token:
+                            results.append(f"❌ `{media_title}` 第{season_number}季 Token获取失败。")
+                            continue
+                    transformed_data = self.transform_data(media_item)
+                    response = await self.add_subscription(self.access_token, transformed_data)
+                    if response and response.get("success") == True:
+                        results.append(f"✅ `{media_title}` 第{season_number}季 订阅成功。")
+                    else:
+                        error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                        results.append(f"⚠️ 订阅 `{media_title}` 第{season_number}季 失败: {error_msg}")
+                self.user_states.pop(userid, None)
+                self.pending_subscription.pop(userid, None)
+                yield event.plain_result("\n".join(results))
+                return
+            if msg.isdigit():
+                idx = int(msg) - 1
+                pending = self.pending_subscription.get(userid)
+                if not pending:
+                    self.user_states.pop(userid, None)
+                    yield event.plain_result("⚠️ 状态已失效，请重新发起订阅。")
+                    return
+                seasons = pending["seasons"]
+                media_item = dict(pending["media_item"])
+                if 0 <= idx < len(seasons):
+                    season_number = seasons[idx].get("season_number", 1)
+                    media_item["season"] = season_number
+                    media_title = media_item.get("title", "未知")
+                    if not self.access_token:
+                        self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+                        if not self.access_token:
+                            yield event.plain_result("⚠️ Token获取失败。")
+                            return
+                    transformed_data = self.transform_data(media_item)
+                    response = await self.add_subscription(self.access_token, transformed_data)
+                    if response and response.get("success") == True:
+                        yield event.plain_result(f"✅ `{media_title}` 第{season_number}季 订阅成功。")
+                    else:
+                        error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                        yield event.plain_result(f"⚠️ 订阅 `{media_title}` 第{season_number}季 失败: {error_msg}")
+                    self.user_states.pop(userid, None)
+                    self.pending_subscription.pop(userid, None)
+                    return
+                else:
+                    yield event.plain_result("⚠️ 序号无效，请重新输入或输入退出。")
+                    return
+            # 非数字输入直接忽略
+            return
+
     # --- terminate, _ensure_token, API methods (保持 v1.3.5 的状态) ---
     async def terminate(self):
         """清理资源并终止插件"""
@@ -686,107 +796,99 @@ HTTP服务: {http_status}
         """确保访问令牌有效，必要时获取新令牌"""
         if not self.access_token:
             self.logger.info("令牌缺失，获取新令牌")
-            self.access_token = self.get_access_token(self.username, self.password, self.token_url)
-            return bool(self.access_token)
+            return False
         return True
         
-    def get_access_token(self, username, password, token_url):
-        """获取API访问令牌"""
+    async def get_access_token(self, username, password, token_url):
+        """获取API访问令牌 (aiohttp)"""
+        self._log_and_check_daily('info', f"请求令牌: {token_url}, 用户名: {username}")
         if not token_url: 
-            self.logger.error("令牌URL未配置")
+            self._log_and_check_daily('error', "令牌URL未配置")
             return None
-            
         data = {"username": username, "password": password}
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        
         try:
-            self.logger.debug(f"请求令牌: {token_url}")
-            response = requests.post(token_url, data=data, headers=headers, timeout=10)
-            response.raise_for_status()
-            token_data = response.json()
-            token = token_data.get("access_token")
-            
-            if token: 
-                self.logger.info("令牌获取成功")
-                return token
-            else: 
-                self.logger.warning(f"响应中无令牌: {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e: 
-            self.logger.error(f"令牌请求错误: {e}")
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(token_url, data=data, headers=headers) as response:
+                    self._log_and_check_daily('debug', f"令牌请求响应状态: {response.status}")
+                    response.raise_for_status()
+                    token_data = await response.json()
+                    self._log_and_check_daily('debug', f"令牌响应内容: {token_data}")
+                    token = token_data.get("access_token")
+                    if token: 
+                        self._log_and_check_daily('info', "令牌获取成功")
+                        return token
+                    else: 
+                        self._log_and_check_daily('warning', f"响应中无令牌: {await response.text()}")
+                        return None
+        except aiohttp.ClientError as e:
+            self._log_and_check_daily('error', f"令牌请求错误: {e}")
             return None
-        except json.JSONDecodeError: 
-            self.logger.error(f"令牌JSON解析错误: {response.text}")
-            return None
-        except Exception as e: 
-            self.logger.error(f"令牌获取未知错误: {e}", exc_info=True)
+        except Exception as e:
+            self._log_and_check_daily('exception', f"令牌获取未知错误: {e}")
             return None
             
-    def search_media(self, access_token, title):
-        """搜索媒体内容"""
+    async def search_media(self, access_token, title):
+        """搜索媒体内容 (aiohttp)"""
+        self._log_and_check_daily('info', f"搜索媒体: {title}")
         if not self.base_url: 
+            self._log_and_check_daily('warning', "base_url未配置")
             return None
-            
         search_url = f"{self.base_url}/api/v1/media/search"
         params = {'title': title, 'type': 'media', 'page': 1, 'count': self.max_results * 2}
         headers = {"accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        
         try:
-            self.logger.debug(f"搜索媒体: {search_url}")
-            response = requests.get(search_url, headers=headers, params=params, timeout=15)
-            
-            if response.status_code == 200: 
-                self.logger.debug("搜索成功")
-                return response.json()
-            elif response.status_code == 401 and self.token_refresh_count < 1:
-                self.logger.warning("搜索需要更新令牌")
-                self.token_refresh_count += 1
-                if self._ensure_token(): 
-                    return self.search_media(self.access_token, title)
-                else: 
-                    return None
-            else: 
-                self.logger.error(f"搜索失败: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e: 
-            self.logger.error(f"搜索请求错误: {e}")
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(search_url, headers=headers, params=params) as response:
+                    self._log_and_check_daily('debug', f"媒体搜索响应状态: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        self._log_and_check_daily('debug', f"媒体搜索响应内容: {data}")
+                        return data
+                    elif response.status == 401 and self.token_refresh_count < 1:
+                        self._log_and_check_daily('warning', "搜索需要更新令牌")
+                        self.token_refresh_count += 1
+                        return None
+                    else:
+                        self._log_and_check_daily('error', f"搜索失败: {response.status} - {await response.text()}")
+                        return None
+        except aiohttp.ClientError as e:
+            self._log_and_check_daily('error', f"搜索请求错误: {e}")
             return None
-        except Exception as e: 
-            self.logger.error(f"搜索未知错误: {e}", exc_info=True)
+        except Exception as e:
+            self._log_and_check_daily('exception', f"搜索未知错误: {e}")
             return None
             
-    def get_subscription_data(self, access_token):
-        """获取订阅数据"""
+    async def get_subscription_data(self, access_token):
+        """获取订阅数据 (aiohttp)"""
+        self._log_and_check_daily('info', "获取订阅数据")
         if not self.subscribe_url: 
+            self._log_and_check_daily('warning', "subscribe_url未配置")
             return None
-            
         headers = {"accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        
         try:
-            self.logger.debug(f"获取订阅数据: {self.subscribe_url}")
-            response = requests.get(self.subscribe_url, headers=headers, timeout=15)
-            
-            if response.status_code == 200: 
-                self.logger.debug("获取订阅成功")
-                return response.json()
-            elif response.status_code == 401 and self.token_refresh_count < 1:
-                self.logger.warning("获取订阅需要更新令牌")
-                self.token_refresh_count += 1
-                if self._ensure_token(): 
-                    return self.get_subscription_data(self.access_token)
-                else: 
-                    return None
-            else: 
-                self.logger.error(f"获取订阅失败: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e: 
-            self.logger.error(f"获取订阅请求错误: {e}")
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.subscribe_url, headers=headers) as response:
+                    self._log_and_check_daily('debug', f"订阅数据响应状态: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        self._log_and_check_daily('debug', f"订阅数据响应内容: {data}")
+                        return data
+                    elif response.status == 401 and self.token_refresh_count < 1:
+                        self._log_and_check_daily('warning', "获取订阅需要更新令牌")
+                        self.token_refresh_count += 1
+                        return None
+                    else:
+                        self._log_and_check_daily('error', f"获取订阅失败: {response.status} - {await response.text()}")
+                        return None
+        except aiohttp.ClientError as e:
+            self._log_and_check_daily('error', f"获取订阅请求错误: {e}")
             return None
-        except Exception as e: 
-            self.logger.error(f"获取订阅未知错误: {e}", exc_info=True)
+        except Exception as e:
+            self._log_and_check_daily('exception', f"获取订阅未知错误: {e}")
             return None
             
     def remove_empty_keys(self, data):
@@ -882,13 +984,11 @@ HTTP服务: {http_status}
     def transform_data(self, data):
         """转换媒体数据为订阅格式"""
         cleaned = self.remove_empty_keys(data) or {}
-        
         # 处理季数
         season = cleaned.get("season")
         if season is None:
             s_years = cleaned.get("season_years")
             num_s = cleaned.get("number_of_seasons")
-            
             if isinstance(s_years, dict) and s_years:
                 try:
                     nums = [int(s) for s in s_years if s.isdigit()]
@@ -904,8 +1004,6 @@ HTTP服务: {http_status}
                 season = int(season)
             except:
                 season = 1
-                
-        # 转换基础字段
         t = {
             k: cleaned.get(m, d) for k, m, d in [
                 ("n", "title", ""),
@@ -922,10 +1020,7 @@ HTTP服务: {http_status}
                 ("dt", "release_date", "")
             ]
         }
-        
-        # 构建最终数据
         tx = {
-            "id": 0,
             "name": t['n'],
             "year": str(t['y'] or ""),
             "type": t['t'],
@@ -963,70 +1058,70 @@ HTTP服务: {http_status}
             "media_category": "",
             "filter_groups": []
         }
-        
+        tx.pop('id', None)
         return tx
         
-    def add_subscription(self, access_token, sub_data):
-        """添加订阅"""
+    async def add_subscription(self, access_token, sub_data):
+        """添加订阅 (aiohttp)"""
+        self._log_and_check_daily('info', f"添加订阅: {sub_data}")
         if not self.subscribe_url:
+            self._log_and_check_daily('warning', "订阅URL未配置")
             return {"success": False, "msg": "订阅URL未配置"}
-            
         headers = {"accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        
         try:
-            self.logger.debug(f"添加订阅请求: {self.subscribe_url}")
-            response = requests.post(self.subscribe_url, headers=headers, json=sub_data, timeout=20)
-            response.raise_for_status()
-            
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                self.logger.error(f"添加订阅响应JSON解析错误: {response.text}")
-                return {"success": False, "msg": "服务器响应格式错误"}
-                
-        except requests.exceptions.HTTPError as e:
-            self.logger.error(f"添加订阅HTTP错误: {e.response.status_code} - {e.response.text}")
-            return {"success": False, "msg": f"HTTP {e.response.status_code}"}
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"添加订阅请求错误: {e}")
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.subscribe_url, headers=headers, json=sub_data) as response:
+                    self._log_and_check_daily('debug', f"添加订阅响应状态: {response.status}")
+                    try:
+                        data = await response.json()
+                        self._log_and_check_daily('debug', f"添加订阅响应内容: {data}")
+                        return data
+                    except Exception:
+                        self._log_and_check_daily('error', f"添加订阅响应JSON解析错误: {await response.text()}")
+                        return {"success": False, "msg": "服务器响应格式错误"}
+        except aiohttp.ClientResponseError as e:
+            self._log_and_check_daily('error', f"添加订阅HTTP错误: {e.status} - {e.message}")
+            return {"success": False, "msg": f"HTTP {e.status}"}
+        except aiohttp.ClientError as e:
+            self._log_and_check_daily('error', f"添加订阅请求错误: {e}")
             return {"success": False, "msg": "网络错误"}
         except Exception as e:
-            self.logger.error(f"添加订阅未知错误: {e}", exc_info=True)
+            self._log_and_check_daily('exception', f"添加订阅未知错误: {e}")
             return {"success": False, "msg": "内部错误"}
             
-    def search_subscription(self, access_token, sub_id=""):
-        """搜索订阅"""
+    async def search_subscription(self, access_token, sub_id=""):
+        """搜索订阅 (aiohttp)"""
+        self._log_and_check_daily('info', f"搜索订阅: {sub_id}")
         if not self.base_url:
+            self._log_and_check_daily('warning', "base_url未配置")
             return None
-            
         headers = {"accept": "application/json", "Authorization": f"Bearer {access_token}"}
         url = f"{self.base_url}/api/v1/subscribe/search/{sub_id}" if sub_id else f"{self.base_url}/api/v1/subscribe/search"
-        
         try:
-            self.logger.debug(f"搜索订阅: {url}")
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 401 and self.token_refresh_count < 1:
-                self.logger.warning("搜索订阅需要更新令牌")
-                self.token_refresh_count += 1
-                if self._ensure_token():
-                    return self.search_subscription(self.access_token, sub_id)
-                else:
-                    return None
-            elif response.status_code == 404:
-                self.logger.warning(f"搜索订阅404错误: ID '{sub_id}'")
-                return {"success": False, "msg": f"ID {sub_id} 未找到"} if sub_id else {"success": True, "data": {"list": []}}
-            else:
-                self.logger.error(f"搜索订阅失败: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"搜索订阅请求错误: {e}")
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as response:
+                    self._log_and_check_daily('debug', f"搜索订阅响应状态: {response.status}")
+                    if response.status == 200:
+                        data = await response.json()
+                        self._log_and_check_daily('debug', f"搜索订阅响应内容: {data}")
+                        return data
+                    elif response.status == 401 and self.token_refresh_count < 1:
+                        self._log_and_check_daily('warning', "搜索订阅需要更新令牌")
+                        self.token_refresh_count += 1
+                        return None
+                    elif response.status == 404:
+                        self._log_and_check_daily('warning', f"搜索订阅404错误: ID '{sub_id}'")
+                        return {"success": False, "msg": f"ID {sub_id} 未找到"} if sub_id else {"success": True, "data": {"list": []}}
+                    else:
+                        self._log_and_check_daily('error', f"搜索订阅失败: {response.status} - {await response.text()}")
+                        return None
+        except aiohttp.ClientError as e:
+            self._log_and_check_daily('error', f"搜索订阅请求错误: {e}")
             return None
         except Exception as e:
-            self.logger.error(f"搜索订阅未知错误: {e}", exc_info=True)
+            self._log_and_check_daily('exception', f"搜索订阅未知错误: {e}")
             return None
 
 # 允许的通知类别
@@ -1121,8 +1216,9 @@ class NotificationHandler(BaseHTTPRequestHandler):
         if body:
             try:
                 body_str = body.decode('utf-8')
-                raw_body_str_for_log = body_str
-                content_str = body_str
+                decoded_body_str = codecs.decode(body_str, 'unicode_escape')
+                raw_body_str_for_log = decoded_body_str
+                content_str = decoded_body_str
                 type_match = re.search(r'"type":\s*"(.*?)"', body_str)
                 if type_match:
                     msg_type = type_match.group(1)
