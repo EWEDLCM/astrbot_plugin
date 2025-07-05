@@ -6,7 +6,7 @@ import datetime
 from datetime import timedelta
 from collections import defaultdict
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from aiohttp import web
 import socket
 from urllib.parse import urlparse, parse_qs
 import sys
@@ -124,13 +124,11 @@ class MediaSearchPlugin(Star):
         self.logger.info(f"插件目录: {self.plugin_dir}")
         self.logger.info(f"日志文件路径: {self.log_file_path}")
         self.logger.info(f"订阅文件路径: {self.subscriptions_file}")
-        
         # 加载订阅
         if self.subscriptions_file:
             self._load_subscriptions()
         else:
             self.logger.warning("订阅持久化已禁用")
-        
         # 初始化API令牌
         if not self.base_url or not self.username or not self.password:
             self.logger.error("API配置不完整")
@@ -138,30 +136,90 @@ class MediaSearchPlugin(Star):
             self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
             if not self.access_token:
                 self.logger.warning("初始令牌获取失败")
-        
         # 初始化通知系统
         if not self.http_forward_enabled:
             self.logger.info("HTTP转发功能已禁用，不启动HTTP服务器")
             return
-            
         self.logger.info("正在初始化通知系统...")
         try:
-            handler_factory = lambda *args, **kwargs: NotificationHandler(*args, **kwargs, message_queue=self.message_queue, logger=self.logger)
-            self.httpd = HTTPServer((LISTEN_ADDRESS, self.listen_port), handler_factory)
-            self.server_thread = threading.Thread(target=self.run_http_server, name="NotificationServerThread", daemon=True)
-            self.server_thread.start()
+            self.http_app = web.Application()
+            self.http_app.add_routes([
+                web.post('/', self.aiohttp_notification_handler),
+                web.put('/', self.aiohttp_notification_handler),
+            ])
+            self.http_runner = web.AppRunner(self.http_app)
+            await self.http_runner.setup()
+            self.http_site = web.TCPSite(self.http_runner, LISTEN_ADDRESS, self.listen_port)
+            await self.http_site.start()
             self.logger.info(f"HTTP服务器启动在 {LISTEN_ADDRESS}:{self.listen_port}")
-            
             self.message_processor_task = asyncio.create_task(self.process_message_queue())
             self.logger.info("消息处理任务已启动")
         except OSError as e:
             self.logger.error(f"HTTP服务器在端口 {self.listen_port} 启动失败: {e}")
-            self.httpd = None
-            self.server_thread = None
+            self.http_app = None
+            self.http_runner = None
+            self.http_site = None
         except Exception as e:
             self.logger.error(f"通知系统初始化失败: {e}", exc_info=True)
-            self.httpd = None
-            self.server_thread = None
+            self.http_app = None
+            self.http_runner = None
+            self.http_site = None
+
+    async def aiohttp_notification_handler(self, request):
+        """aiohttp异步HTTP通知处理"""
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        msg_type = "未知"; content_str = ""; raw_body_str_for_log = "(No body)"
+        body_type_guess = "Unknown"
+        log_entry = f"\n----- HTTP Log Start -----\n"
+        log_entry += f"Timestamp: {timestamp}\n"
+        log_entry += f"Client: {request.remote}\n"
+        log_entry += f"Method: {request.method}\n"
+        log_entry += f"Path: {request.path}\n"
+        try:
+            body = await request.read()
+            if body:
+                try:
+                    body_str = body.decode('utf-8')
+                    decoded_body_str = codecs.decode(body_str, 'unicode_escape')
+                    raw_body_str_for_log = decoded_body_str
+                    content_str = decoded_body_str
+                    type_match = re.search(r'"type":\s*"(.*?)"', body_str)
+                    if type_match:
+                        msg_type = type_match.group(1)
+                        body_type_guess = "Text (Type found by Regex)"
+                        log_entry += f"Body Type Guess: {body_type_guess}: {msg_type}\n"
+                    else:
+                        try:
+                            json.loads(body_str)
+                            body_type_guess = "Valid JSON (Type missing?)"
+                        except json.JSONDecodeError:
+                            body_type_guess = "Text (Type not found)"
+                        msg_type = "文本"
+                        log_entry += f"Body Type Guess: {body_type_guess}\n"
+                except UnicodeDecodeError:
+                    msg_type = "原始数据"
+                    content_str = f"(Undecodable: {body!r})"
+                    raw_body_str_for_log = content_str
+                    body_type_guess = "Undecodable"
+                    log_entry += f"Body Type Guess: {body_type_guess}\n"
+                    log_entry += f"Raw Bytes: {body!r}\n"
+            else:
+                log_entry += f"Body: None\n"
+                body_type_guess = "No Body"
+            log_entry += f"Body Type Determination: {body_type_guess}\n"
+            log_entry += f"Raw Body Content: {raw_body_str_for_log}\n"
+            if content_str not in ["", "(No body)"]:
+                self.message_queue.put((timestamp, msg_type, content_str))
+                log_entry += f"Message Queued: Yes (Final Type: {msg_type})\n"
+            else:
+                log_entry += f"Message Queued: No (Empty content)\n"
+            log_entry += f"----- HTTP Log End -----\n"
+            self.logger.info(log_entry)
+            sys.stdout.flush()
+            return web.Response(status=200, text="Notification received.")
+        except Exception as e:
+            self.logger.error(f"aiohttp通知处理异常: {e}", exc_info=True)
+            return web.Response(status=500, text="Internal Server Error.")
 
     def _load_subscriptions(self):
         """从文件加载通知订阅"""
@@ -710,39 +768,30 @@ HTTP服务: {http_status}
     async def terminate(self):
         """清理资源并终止插件"""
         self.logger.info("终止MediaSearchPlugin...")
-        
-        # 如果HTTP转发功能没有启用，无需清理HTTP服务器资源
         if not self.http_forward_enabled:
             self.logger.info("HTTP转发功能未启用，跳过HTTP资源清理")
             return
-        
         # 停止HTTP服务器
-        if self.httpd and self.server_thread and self.server_thread.is_alive():
+        if hasattr(self, 'http_runner') and self.http_runner:
             self.logger.info("正在停止HTTP服务器...")
-            self.server_stop_event.set()
             try:
-                with socket.create_connection(('127.0.0.1', self.listen_port), timeout=0.5): pass
-            except Exception: pass
-            
-            self.server_thread.join(timeout=5.0)
-            if self.server_thread.is_alive(): 
-                self.logger.warning("HTTP线程未正常停止")
-            else: 
-                self.logger.info("HTTP线程已停止")
-                
-        self.httpd = None
-        
+                await self.http_runner.cleanup()
+                self.logger.info("HTTP服务器已停止")
+            except Exception as e:
+                self.logger.warning(f"HTTP服务器关闭异常: {e}")
+            self.http_runner = None
+            self.http_site = None
+            self.http_app = None
         # 取消消息处理任务
         if self.message_processor_task and not self.message_processor_task.done():
             self.logger.info("正在取消消息处理任务...")
             self.message_processor_task.cancel()
-            try: 
+            try:
                 await self.message_processor_task
-            except asyncio.CancelledError: 
+            except asyncio.CancelledError:
                 self.logger.info("消息处理任务已取消")
-            except Exception as e: 
+            except Exception as e:
                 self.logger.error(f"取消任务时出错: {e}")
-                
         self.logger.info("MediaSearchPlugin已终止")
 
     def _ensure_token(self) -> bool:
@@ -1088,17 +1137,22 @@ LISTEN_ADDRESS = '0.0.0.0'
 
 # 获取本机 IP 地址
 def get_local_ip():
-    """尝试获取本机的主要IP地址"""
-    s = None
+    """安全地获取本机的主要IPv4地址，不进行外部网络连接"""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and not ip.startswith("127."):
+            return ip
+        # 进一步遍历所有网卡
+        for info in socket.getaddrinfo(hostname, None):
+            family, _, _, _, sockaddr = info
+            if family == socket.AF_INET:
+                candidate = sockaddr[0]
+                if not candidate.startswith("127."):
+                    return candidate
     except Exception:
-        ip = '127.0.0.1'
-    finally:
-        if s: s.close()
-    return ip
+        pass
+    return "127.0.0.1"
 
 # 请求处理器
 class NotificationHandler(BaseHTTPRequestHandler):
