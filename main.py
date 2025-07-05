@@ -6,8 +6,6 @@ import datetime
 from datetime import timedelta
 from collections import defaultdict
 import threading
-import logging
-import logging.handlers
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import socket
 from urllib.parse import urlparse, parse_qs
@@ -18,8 +16,9 @@ import re
 import codecs
 import time
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 import astrbot.api
+from astrbot.api import logger
 
 # --- 插件介绍代码内容 ---
 @register("astrbot_plugin_mp", "EWEDL", "MoviePilot小工具", "1.5.0")
@@ -49,67 +48,26 @@ class MediaSearchPlugin(Star):
     def _init_paths(self):
         """初始化插件所需的路径配置"""
         try:
-            self.plugin_dir = Path(__file__).resolve().parent
-            self.subscriptions_file = self.plugin_dir / "mp_sub.json"
-            self.log_file_path = self.plugin_dir / "http.log"
-        except NameError:
-            cwd = Path.cwd()
-            self.plugin_dir = cwd
-            self.subscriptions_file = cwd / "mp_sub.json"
-            self.log_file_path = cwd / "http.log"
+            self.data_dir = StarTools.get_data_dir()
+            self.plugin_dir = self.data_dir
+            self.subscriptions_file = self.data_dir / "mp_sub.json"
+            self.log_file_path = self.data_dir / "http.log"
         except Exception:
-            # 如果上面方法都失败，使用固定相对路径
             self.plugin_dir = Path(".")
             self.subscriptions_file = Path("./mp_sub.json")
             self.log_file_path = Path("./http.log")
 
     def _init_logging(self):
-        """初始化日志系统，支持每日0点清空详细日志，并在插件启动时清空日志"""
-        self.logger = logging.getLogger("MediaSearchPlugin")
-        self.logger.setLevel(logging.DEBUG)  # 详细日志
-        self.logger.propagate = False
-        for handler in self.logger.handlers[:]:
-            self.logger.removeHandler(handler)
-        log_formatter = logging.Formatter('[%(asctime)s][%(levelname)s][%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        # 日志文件名
-        self.detailed_log_file = self.plugin_dir / "detailed.log"
-        # 启动时清空日志
-        try:
-            self.detailed_log_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.detailed_log_file, 'w', encoding='utf-8') as f:
-                f.write(f"--- 日志已于插件启动时({datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) 自动清空 ---\n")
-        except Exception as e:
-            print(f"[ERROR] 启动时清空日志失败: {e}", file=sys.stderr)
-        self._check_and_clear_daily_log()
-        try:
-            file_handler = logging.FileHandler(str(self.detailed_log_file), mode='a', encoding='utf-8')
-            file_handler.setFormatter(log_formatter)
-            file_handler.setLevel(logging.DEBUG)
-            self.logger.addHandler(file_handler)
-            self.logger.info("详细日志系统初始化完成，保存在: %s", self.detailed_log_file)
-        except Exception as e:
-            console_handler = logging.StreamHandler(sys.stderr)
-            console_handler.setFormatter(log_formatter)
-            self.logger.addHandler(console_handler)
-            self.logger.warning("文件日志配置失败，使用控制台日志: %s", e)
+        """初始化日志系统，使用框架logger，不再自定义文件日志"""
+        self.logger = logger
+        self.logger.info(f"详细日志系统初始化完成，保存在框架日志中")
 
     def _check_and_clear_daily_log(self):
-        """每天0点后自动清空日志文件"""
-        if self.detailed_log_file.exists():
-            try:
-                log_mod_time = self.detailed_log_file.stat().st_mtime
-                log_dt = datetime.datetime.fromtimestamp(log_mod_time)
-                now = datetime.datetime.now()
-                if log_dt.date() != now.date():
-                    with open(self.detailed_log_file, 'w', encoding='utf-8') as f:
-                        f.write(f"--- 日志已于 {now.strftime('%Y-%m-%d %H:%M:%S')} 自动清空 ---\n")
-                    print(f"[INFO] 日志已于新的一天自动清空: {self.detailed_log_file}", file=sys.stderr)
-            except Exception as e:
-                print(f"[ERROR] 日志每日清空失败: {e}", file=sys.stderr)
+        """已弃用：每日清空日志逻辑，交由框架日志管理"""
+        pass
 
     def _log_and_check_daily(self, level, msg, *args, **kwargs):
-        """写日志前自动检查是否需要清空"""
-        self._check_and_clear_daily_log()
+        """写日志，直接调用框架logger"""
         if level == 'debug':
             self.logger.debug(msg, *args, **kwargs)
         elif level == 'info':
@@ -756,7 +714,6 @@ HTTP服务: {http_status}
         # 如果HTTP转发功能没有启用，无需清理HTTP服务器资源
         if not self.http_forward_enabled:
             self.logger.info("HTTP转发功能未启用，跳过HTTP资源清理")
-            logging.shutdown()
             return
         
         # 停止HTTP服务器
@@ -787,8 +744,6 @@ HTTP服务: {http_status}
                 self.logger.error(f"取消任务时出错: {e}")
                 
         self.logger.info("MediaSearchPlugin已终止")
-        # 关闭所有日志处理程序
-        logging.shutdown()
 
     def _ensure_token(self) -> bool:
         """确保访问令牌有效，必要时获取新令牌"""
@@ -1145,53 +1100,6 @@ def get_local_ip():
         if s: s.close()
     return ip
 
-# 自定义倒序日志处理器
-class ReverseOrderFileHandler(logging.FileHandler):
-    """将新日志记录在文件顶部的自定义日志处理器"""
-    def __init__(self, filename, mode='a', encoding=None, delay=False):
-        # 确保文件首先存在
-        path = Path(filename)
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(filename, 'w', encoding=encoding or 'utf-8') as f:
-                f.write("")
-                
-        super().__init__(filename, mode='r+', encoding=encoding, delay=False)
-        self.lock = threading.RLock()
-
-    def emit(self, record):
-        with self.lock:
-            try:
-                msg = self.format(record) + "\n"
-                # 读取现有内容
-                try:
-                    self.stream.seek(0, 0)
-                    old_content = self.stream.read()
-                except Exception:
-                    old_content = ""
-                
-                # 写入新内容
-                try:
-                    self.stream.seek(0, 0)
-                    self.stream.write(msg)
-                    if old_content:
-                        self.stream.write(old_content)
-                    self.stream.truncate()
-                    self.flush()
-                except Exception:
-                    # 如果写入失败，尝试重新打开文件并写入
-                    self.stream.close()
-                    with open(self.baseFilename, 'w', encoding=self.encoding) as f:
-                        f.write(msg)
-                        if old_content:
-                            f.write(old_content)
-            except Exception:
-                self.handleError(record)
-
-    def close(self):
-        with self.lock:
-            super().close()
-
 # 请求处理器
 class NotificationHandler(BaseHTTPRequestHandler):
     """处理接收到的HTTP通知请求"""
@@ -1294,4 +1202,3 @@ class NotificationHandler(BaseHTTPRequestHandler):
                 self.logger.error(f"PUT read error: {e}", exc_info=True)
         self._process_and_queue(body=body)
         self._send_response()
-
