@@ -185,58 +185,57 @@ class MediaSearchPlugin(Star):
             self.http_runner = None
             self.http_site = None
 
-    async def aiohttp_notification_handler(self, request):
-        """aiohttp异步HTTP通知处理"""
+    async def aiohttp_notification_handler(self, request: web.Request) -> web.Response:
+        """
+        异步处理收到的HTTP通知。
+        此函数负责解码请求体，并从中提取消息类型，然后将原始消息体和类型放入队列。
+        """
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        msg_type = "未知"; content_str = ""; raw_body_str_for_log = "(No body)"
-        body_type_guess = "Unknown"
-        log_entry = f"\n----- HTTP Log Start -----\n"
-        log_entry += f"Timestamp: {timestamp}\n"
-        log_entry += f"Client: {request.remote}\n"
-        log_entry += f"Method: {request.method}\n"
-        log_entry += f"Path: {request.path}\n"
+        client_ip = request.remote
+        log_entry = [f"\n----- HTTP Log Start -----"]
+        log_entry.append(f"Timestamp: {timestamp}")
+        log_entry.append(f"Client: {client_ip}")
+        log_entry.append(f"Method: {request.method}")
+        log_entry.append(f"Path: {request.path}")
+
+        msg_type = "未知"
+        body_str = ""
+        body_description = "No Body"
+
         try:
-            body = await request.read()
-            if body:
+            if request.has_body:
+                body_bytes = await request.read()
                 try:
-                    body_str = body.decode('utf-8')
-                    decoded_body_str = codecs.decode(body_str, 'unicode_escape')
-                    raw_body_str_for_log = decoded_body_str
-                    content_str = decoded_body_str
+                    # 解码请求体
+                    body_str = body_bytes.decode('utf-8')
+                    body_description = "Text" # 初始假定为文本
+                    # 无论JSON是否有效，都尝试用正则提取type
                     type_match = re.search(r'"type":\s*"(.*?)"', body_str)
                     if type_match:
                         msg_type = type_match.group(1)
-                        body_type_guess = "Text (Type found by Regex)"
-                        log_entry += f"Body Type Guess: {body_type_guess}: {msg_type}\n"
+                        body_description = f"Text (Type found by Regex: {msg_type})"
                     else:
-                        try:
-                            json.loads(body_str)
-                            body_type_guess = "Valid JSON (Type missing?)"
-                        except json.JSONDecodeError:
-                            body_type_guess = "Text (Type not found)"
-                        msg_type = "文本"
-                        log_entry += f"Body Type Guess: {body_type_guess}\n"
+                        msg_type = "文本" # 如果连type字段都找不到
                 except UnicodeDecodeError:
+                    body_str = f"(Undecodable bytes: {body_bytes!r})"
                     msg_type = "原始数据"
-                    content_str = f"(Undecodable: {body!r})"
-                    raw_body_str_for_log = content_str
-                    body_type_guess = "Undecodable"
-                    log_entry += f"Body Type Guess: {body_type_guess}\n"
-                    log_entry += f"Raw Bytes: {body!r}\n"
+                    body_description = "Undecodable"
+            
+            log_entry.append(f"Body Type: {body_description}")
+            log_entry.append(f"Raw Body Content: {body_str if body_str else '(No body)'}")
+
+            if body_str:
+                # 将原始字符串和提取出的类型放入队列
+                self.message_queue.put((timestamp, msg_type, body_str))
+                log_entry.append(f"Message Queued: Yes (Final Type: {msg_type})")
             else:
-                log_entry += f"Body: None\n"
-                body_type_guess = "No Body"
-            log_entry += f"Body Type Determination: {body_type_guess}\n"
-            log_entry += f"Raw Body Content: {raw_body_str_for_log}\n"
-            if content_str not in ["", "(No body)"]:
-                self.message_queue.put((timestamp, msg_type, content_str))
-                log_entry += f"Message Queued: Yes (Final Type: {msg_type})\n"
-            else:
-                log_entry += f"Message Queued: No (Empty content)\n"
-            log_entry += f"----- HTTP Log End -----\n"
-            self.logger.info(log_entry, extra={"plugin": "mp"})
-            sys.stdout.flush()
+                log_entry.append("Message Queued: No (Empty content)")
+
+            log_entry.append("----- HTTP Log End -----\n")
+            self.logger.info("\n".join(log_entry), extra={"plugin": "mp"})
+            
             return web.Response(status=200, text="Notification received.")
+
         except Exception as e:
             self.logger.error(f"aiohttp通知处理异常: {e}", exc_info=True, extra={"plugin": "mp"})
             return web.Response(status=500, text="Internal Server Error.")
@@ -315,12 +314,16 @@ class MediaSearchPlugin(Star):
         self.logger.info("HTTP服务器socket已关闭", extra={"plugin": "mp"})
 
     async def process_message_queue(self):
-        """异步处理消息队列，解析通知并发送到订阅者"""
-        self.logger.info("消息处理循环已启动 (正则优先 + 条件解码模式)", extra={"plugin": "mp"})
+        """
+        异步处理消息队列，解析通知并发送到订阅者。
+        此版本简化了消息解析逻辑，优先处理JSON，否则作为纯文本。
+        """
+        self.logger.info("消息处理循环已启动 (JSON优先模式)", extra={"plugin": "mp"})
+        
+        # 正则表达式用于从可能无效的JSON字符串中提取字段
         title_pattern = re.compile(r'"title":\s*"(.*?)"', re.DOTALL)
         message_pattern = re.compile(r'"message":\s*"((?:.|\n)*?)"\s*(?:,|}|\Z)', re.DOTALL)
-        unicode_escape_pattern = re.compile(r'\\u[0-9a-fA-F]{4}')
-        
+
         while True:
             try:
                 if self.message_queue.empty():
@@ -330,76 +333,78 @@ class MediaSearchPlugin(Star):
                 timestamp, msg_type, content_str = self.message_queue.get_nowait()
                 self.logger.info(f"处理消息. 类型='{msg_type}'", extra={"plugin": "mp"})
                 
-                # 解析消息内容
                 formatted_message = ""
-                title = None
-                message = None
-                processed_by = "正则提取"
                 
                 try:
-                    # 尝试匹配标题和消息内容
+                    # 优先尝试将内容解析为标准JSON
+                    data = json.loads(content_str)
+                    title = data.get("title")
+                    message = data.get("message")
+
+                    # 过滤掉 None 或 "None"
+                    valid_title = title if title is not None and title != "None" else None
+                    valid_message = message if message is not None and message != "None" else None
+                    
+                    if valid_title and valid_message:
+                        formatted_message = f"{valid_title}\n{valid_message}"
+                    elif valid_title:
+                        formatted_message = valid_title
+                    elif valid_message:
+                        formatted_message = valid_message
+                    else:
+                        # 如果两者都无效，则不发送任何内容
+                        formatted_message = ""
+                except json.JSONDecodeError:
+                    # 如果JSON解析失败，回退到正则提取
+                    self.logger.warning(f"JSON解析失败，回退到正则提取. 内容: {content_str[:100]}...", extra={"plugin": "mp"})
                     title_match = title_pattern.search(content_str)
                     message_match = message_pattern.search(content_str)
                     
-                    raw_title = title_match.group(1) if title_match else None
-                    raw_message = message_match.group(1) if message_match else None
-                    
-                    # 处理Unicode转义
-                    if raw_title is not None and raw_message is not None:
-                        if unicode_escape_pattern.search(content_str):
-                            self.logger.info("发现Unicode转义字符，尝试解码", extra={"plugin": "mp"})
-                            try:
-                                title = codecs.decode(raw_title, 'unicode_escape')
-                                message = codecs.decode(raw_message, 'unicode_escape')
-                            except Exception as decode_err:
-                                self.logger.error(f"解码失败: {decode_err}，使用原始文本", extra={"plugin": "mp"})
-                                title = raw_title
-                                message = raw_message
-                        else:
-                            title = raw_title
-                            message = raw_message
+                    title = title_match.group(1) if title_match else None
+                    message = message_match.group(1) if message_match else None
+
+                    # 清理可能存在的转义符
+                    if title: title = title.replace('\\n', '\n').replace('\\"', '"')
+                    if message: message = message.replace('\\n', '\n').replace('\\"', '"')
+
+                    # 过滤掉 None 或 "None"
+                    valid_title = title if title is not None and title != "None" else None
+                    valid_message = message if message is not None and message != "None" else None
+
+                    if valid_title and valid_message:
+                        formatted_message = f"{valid_title}\n{valid_message}"
+                    elif valid_title:
+                        formatted_message = valid_title
+                    elif valid_message:
+                        formatted_message = valid_message
                     else:
-                        if raw_title is not None:
-                            title = raw_title
-                        if raw_message is not None:
-                            message = raw_message
-                except Exception as regex_err:
-                    self.logger.error(f"正则解析错误: {regex_err}", extra={"plugin": "mp"})
-                
-                # 组装最终消息（优化：过滤None和'None'字符串）
-                if title is not None and message is not None and message not in [None, "None"]:
-                    formatted_message = f"{title}\n{message}"
-                elif title is not None:
-                    formatted_message = title
-                elif message is not None and message not in [None, "None"]:
-                    formatted_message = message
-                else:
-                    formatted_message = content_str
-                    self.logger.warning("使用原始内容", extra={"plugin": "mp"})
+                        # 如果两者都无效，则不发送任何内容
+                        formatted_message = ""
                 
                 # 发送消息给订阅者
                 if formatted_message:
                     subs_copy = dict(self.notification_subscriptions)
-                    sent = False
+                    sent_to_any = False
                     
                     for cid, cats in subs_copy.items():
-                        match = (msg_type in cats) and (msg_type in ALLOWED_CATEGORIES)
-                        all_cats = "所有" in cats
+                        is_subscribed_to_all = "所有" in cats
+                        is_subscribed_to_type = msg_type in cats and msg_type in ALLOWED_CATEGORIES
                         
-                        if all_cats or match:
+                        if is_subscribed_to_all or is_subscribed_to_type:
                             try:
                                 await self.context.send_message(cid, MessageChain().message(formatted_message))
                                 self.logger.info(f"消息已发送 (类型: {msg_type}) 到: {cid}", extra={"plugin": "mp"})
-                                sent = True
+                                sent_to_any = True
                             except Exception as e:
                                 self.logger.error(f"发送失败 到 {cid}: {e}", extra={"plugin": "mp"})
                     
-                    if not sent:
+                    if not sent_to_any:
                         self.logger.debug(f"没有类型为 '{msg_type}' 的订阅", extra={"plugin": "mp"})
                 else:
                     self.logger.warning(f"格式化消息为空 (类型: {msg_type})，不发送", extra={"plugin": "mp"})
                 
                 self.message_queue.task_done()
+
             except asyncio.CancelledError:
                 self.logger.info("处理任务被取消", extra={"plugin": "mp"})
                 break
