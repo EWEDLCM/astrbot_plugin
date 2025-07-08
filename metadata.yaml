@@ -1,6 +1,6 @@
 name: astrbot_plugin_mp
 desc: EWEDLCM - MoviePilot小工具
-help: 请使用"/MP 菜单"查看使用方式
+help: 请使用"/mp 菜单"查看使用方式
 version: v1.5.0
 author: EWEDL
 repo: https://github.com/EWEDLCM/astrbot_plugin_mp
